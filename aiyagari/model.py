@@ -1,5 +1,5 @@
 import numpy as np
-from numba import njit, prange
+from numba import njit
 
 
 @njit(cache=True, fastmath=True)
@@ -20,89 +20,53 @@ def _interp_1d(grid, vals, x):
 
 
 @njit(cache=True, fastmath=True)
-def _transfer(a, b, phi_a, a_thresh):
-    excess = a - a_thresh
-    if excess < 0.0:
-        excess = 0.0
-    out = b - phi_a * excess
-    return out if out > 0.0 else 0.0
+def egm_solve(c_pol, a_grid, x, dx, pi, beta, eta, tol, max_iter):
+    """
+    Endogenous-grid-method iteration on the consumption policy.
 
-
-@njit(cache=True, fastmath=True)
-def _action_value_cont(a_prime, cih, iz, v, a_grid, beta, eta, pi):
-    c = cih - a_prime
-    if c <= 0.0:
-        return -1e30
-    fv = pi[iz, 0] * _interp_1d(a_grid, v[:, 0], a_prime) + \
-         pi[iz, 1] * _interp_1d(a_grid, v[:, 1], a_prime)
-    return (c ** (1.0 - eta) - 1.0) / (1.0 - eta) + beta * fv
-
-
-@njit(cache=True, fastmath=True)
-def _gss(a, b, cih, iz, v, a_grid, beta, eta, pi, tol=1e-8, max_iter=500):
-    phi = (np.sqrt(5.0) - 1.0) / 2.0
-    c = b - phi * (b - a)
-    d = a + phi * (b - a)
-    fc = _action_value_cont(c, cih, iz, v, a_grid, beta, eta, pi)
-    fd = _action_value_cont(d, cih, iz, v, a_grid, beta, eta, pi)
-    for _ in range(max_iter):
-        if abs(b - a) < tol:
-            break
-        if fc < fd:
-            a, c, fc = c, d, fd
-            d = a + phi * (b - a)
-            fd = _action_value_cont(d, cih, iz, v, a_grid, beta, eta, pi)
-        else:
-            b, d, fd = d, c, fc
-            c = b - phi * (b - a)
-            fc = _action_value_cont(c, cih, iz, v, a_grid, beta, eta, pi)
-    mid = (a + b) / 2.0
-    return mid, _action_value_cont(mid, cih, iz, v, a_grid, beta, eta, pi)
-
-
-@njit(cache=True, fastmath=True)
-def _action_value_disc(ia_prime, cih, iz, v, a_grid, beta, eta, pi):
-    c = cih - a_grid[ia_prime]
-    if c <= 0.0:
-        return -1e30
-    fv = pi[iz, 0] * v[ia_prime, 0] + pi[iz, 1] * v[ia_prime, 1]
-    return (c ** (1.0 - eta) - 1.0) / (1.0 - eta) + beta * fv
-
-
-@njit(cache=True, fastmath=True, parallel=True)
-def bellman_operator(Tv, v, a_pol, tau, r, w, b, a_grid, beta, eta, pi,
-                     phi_a, a_thresh, do_opt):
-    Na, Nz = v.shape
-    for idx in prange(Na * Nz):
-        ia = idx % Na
-        iz = idx // Na
-        a = a_grid[ia]
-        if iz == 0:
-            cih = (1.0 + (1.0 - tau) * r) * a + (1.0 - tau) * w
-        else:
-            cih = (1.0 + (1.0 - tau) * r) * a + _transfer(a, b, phi_a, a_thresh)
-
-        if do_opt:
-            lo, hi = 0, Na - 1
-            while hi - lo > 2:
-                mid = (lo + hi) // 2
-                if _action_value_disc(mid + 1, cih, iz, v, a_grid, beta, eta, pi) > \
-                   _action_value_disc(mid, cih, iz, v, a_grid, beta, eta, pi):
-                    lo = mid
+    c_pol : (Na, 2) consumption on the exogenous asset grid, updated in place.
+    x     : (Na, 2) cash on hand x_z(a) = R a + inc_z(a).
+    dx    : (Na, 2) d x_z / d a (marginal return to assets, enters the Euler
+            equation because the unemployment transfer depends on assets).
+    """
+    Na = a_grid.shape[0]
+    c_endo = np.empty(Na)
+    x_endo = np.empty(Na)
+    c_new = np.empty_like(c_pol)
+    it = 0
+    for it in range(max_iter):
+        for z in range(2):
+            for j in range(Na):
+                m = 0.0
+                for z2 in range(2):
+                    m += pi[z, z2] * dx[j, z2] * c_pol[j, z2] ** (-eta)
+                c_endo[j] = (beta * m) ** (-1.0 / eta)
+                x_endo[j] = c_endo[j] + a_grid[j]
+            # guard against tiny non-monotonicities at the asset-test kinks
+            for j in range(1, Na):
+                if x_endo[j] <= x_endo[j - 1]:
+                    x_endo[j] = x_endo[j - 1] + 1e-12
+            for i in range(Na):
+                xi = x[i, z]
+                if xi <= x_endo[0]:
+                    c = xi - a_grid[0]          # borrowing constraint binds
+                elif xi >= x_endo[Na - 1]:      # extrapolate last segment
+                    slope = (c_endo[Na - 1] - c_endo[Na - 2]) / \
+                            (x_endo[Na - 1] - x_endo[Na - 2])
+                    c = c_endo[Na - 1] + slope * (xi - x_endo[Na - 1])
                 else:
-                    hi = mid + 1
-            a_lo, a_hi = a_grid[lo], a_grid[hi]
-            if a_hi <= a_lo:
-                a_star = a_lo
-                val = _action_value_cont(a_star, cih, iz, v, a_grid, beta, eta, pi)
-            else:
-                a_star, val = _gss(a_lo, a_hi, cih, iz, v, a_grid, beta, eta, pi)
-        else:
-            a_star = a_pol[ia, iz]
-            val = _action_value_cont(a_star, cih, iz, v, a_grid, beta, eta, pi)
-
-        Tv[ia, iz] = val
-        a_pol[ia, iz] = a_star
+                    c = _interp_1d(x_endo, c_endo, xi)
+                c_new[i, z] = c if c > 1e-12 else 1e-12
+        diff = 0.0
+        for i in range(Na):
+            for z in range(2):
+                d = abs(c_new[i, z] - c_pol[i, z])
+                if d > diff:
+                    diff = d
+                c_pol[i, z] = c_new[i, z]
+        if diff < tol:
+            break
+    return it
 
 
 @njit(cache=True, fastmath=True)
@@ -170,15 +134,6 @@ def markov_operator(Tdist, dist, lo, hi, w_lo, w_hi, pi):
                 Tdist[kp1, iz2] += p * wh
 
 
-@njit(cache=True, fastmath=True)
-def transfer_vec(a_grid, b, phi_a, a_thresh):
-    """Vectorized transfer for the full distribution grid."""
-    out = np.empty(len(a_grid))
-    for i in range(len(a_grid)):
-        out[i] = _transfer(a_grid[i], b, phi_a, a_thresh)
-    return out
-
-
 def stationary_markov(pi):
     w, V = np.linalg.eig(pi.T)
     v = V[:, np.isclose(w, 1.0)].real
@@ -187,30 +142,48 @@ def stationary_markov(pi):
     return (v / v.sum())[:, 0]
 
 
+def _power_grid(amin, amax, n, curv):
+    t = np.linspace(0.0, 1.0, n)
+    return amin + (amax - amin) * t ** curv
+
+
 class AiyagariModel:
+    """
+    Aiyagari economy with two employment states.  The unemployed receive a
+    universal unemployment-insurance transfer b_ui plus an asset-tested
+    housing-allowance component:
+
+        B(a) = b_ui + max(0, b_ha - phi_a * max(a - a_thresh, 0))
+
+    A proportional tax tau on capital and labour income balances the budget.
+    """
+
     def __init__(
         self,
-        beta: float = 0.95,
+        beta: float = 0.9384,
         eta: float = 2.0,
-        delta: float = 0.04,
-        alpha: float = 0.36,
-        b: float = 0.1,
-        tau0: float = 0.02,
-        K0: float = 30.0,
-        peu: float = 0.0435,
-        pue: float = 0.5,
-        amin: float = -2.0,
-        amax: float = 30.0,
-        num_a: int = 2000,
-        num_a_dist_factor: int = 3,
+        delta: float = 0.06,
+        alpha: float = 0.38,
+        b_ui: float = 0.58,
+        b_ha: float = 0.10,
         phi_a: float = 0.0,
-        a_thresh: float = 1.0,
+        a_thresh: float = 0.27,
+        tau0: float = 0.012,
+        K0: float = 6.0,
+        peu: float = 0.0642,
+        pue: float = 0.70,
+        amin: float = -0.32,
+        amax: float = 40.0,
+        num_a: int = 400,
+        num_a_dist: int = 1600,
+        grid_curv: float = 3.0,
     ):
         self.beta = beta
         self.eta = eta
         self.delta = delta
         self.alpha = alpha
-        self.b = b
+        self.b_ui = b_ui
+        self.b_ha = b_ha
         self.phi_a = phi_a
         self.a_thresh = a_thresh
         self.tau = tau0
@@ -224,12 +197,20 @@ class AiyagariModel:
         self.amin = amin
         self.amax = amax
         self.num_a = num_a
-        self.a_grid = np.linspace(amin, amax, num_a)
-        self.a_grid_dist = np.linspace(amin, amax, num_a * num_a_dist_factor)
+        self.a_grid = _power_grid(amin, amax, num_a, grid_curv)
+        self.a_grid_dist = _power_grid(amin, amax, num_a_dist, grid_curv)
 
+        self.c_pol = None
+        self.a_pol = None
         self.v = None
+        self.dist = None
         self.K = K0
         self.update_prices(K0)
+
+    # welfare.py historically used .dist_grid
+    @property
+    def dist_grid(self):
+        return self.a_grid_dist
 
     def update_prices(self, K):
         L = self.pi_stat[0]
@@ -237,14 +218,43 @@ class AiyagariModel:
         self.r = self.alpha * kl ** (self.alpha - 1.0) - self.delta
         self.w = (1.0 - self.alpha) * kl ** self.alpha
 
+    def transfer_profile(self, a_grid=None, b_ha=None):
+        """Total transfer B(a) received by an unemployed household."""
+        a = self.a_grid_dist if a_grid is None else a_grid
+        bh = self.b_ha if b_ha is None else b_ha
+        ha = np.clip(bh - self.phi_a * np.maximum(a - self.a_thresh, 0.0),
+                     0.0, None)
+        return self.b_ui + ha
+
+    def cash_on_hand(self, a_grid):
+        """x_z(a) and d x_z / d a on a grid, for the current prices."""
+        R = 1.0 + (1.0 - self.tau) * self.r
+        n = len(a_grid)
+        x = np.empty((n, 2))
+        dx = np.empty((n, 2))
+        x[:, 0] = R * a_grid + (1.0 - self.tau) * self.w
+        dx[:, 0] = R
+        x[:, 1] = R * a_grid + self.transfer_profile(a_grid)
+        dx[:, 1] = R
+        if self.phi_a > 0.0 and self.b_ha > 0.0:
+            taper_end = self.a_thresh + self.b_ha / self.phi_a
+            in_taper = (a_grid > self.a_thresh) & (a_grid < taper_end)
+            dx[in_taper, 1] = R - self.phi_a
+        return x, dx
+
     def aggregate_capital(self):
-        return float(np.dot(self.dist[:, 0] + self.dist[:, 1], self.a_grid_dist))
+        return float(np.dot(self.dist[:, 0] + self.dist[:, 1],
+                            self.a_grid_dist))
 
     def aggregate_transfer(self):
-        tr = transfer_vec(self.a_grid_dist, self.b, self.phi_a, self.a_thresh)
+        tr = self.transfer_profile()
         return float(np.dot(self.dist[:, 1], tr))
 
     def implied_tau(self):
         costs = self.aggregate_transfer()
         denom = self.r * self.K + self.w * self.pi_stat[0]
         return costs / denom if denom > 0.0 else 0.0
+
+    def output(self):
+        L = self.pi_stat[0]
+        return self.K ** self.alpha * L ** (1.0 - self.alpha)
