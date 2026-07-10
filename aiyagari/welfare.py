@@ -3,18 +3,20 @@ import numpy as np
 
 def summarize_equilibrium(mod, label):
     grid = mod.a_grid_dist
-    tr = mod.transfer_profile(grid)                       # actual transfer
-    tr_full = np.full_like(grid, mod.b_ui + mod.b_ha)     # no asset test
-    ha = tr - mod.b_ui                                    # housing component
+    tr = mod.transfer_matrix(grid)                       # (M, Nz)
+    ha_full = np.outer(np.full(len(grid), mod.b_ha),
+                       mod.labor.ha_elig.astype(float))
+    tr_full = mod.labor.b0[None, :] + ha_full            # no asset test
+    ha = tr - mod.labor.b0[None, :]                      # housing component
 
-    mu_u = mod.dist[:, 1]
-    benefit_costs = float(np.dot(mu_u, tr))
-    share_receiving_ha = float(np.sum(mu_u[ha > 1e-12]))
+    benefit_costs = float(np.sum(mod.dist * tr))
+    elig_mass = float(mod.dist[:, mod.labor.ha_elig].sum())
+    share_receiving_ha = float(np.sum(mod.dist[ha > 1e-12]))
 
-    bite_mask = (tr_full - tr) > 1e-12
-    asset_test_bite_mass = float(np.sum(mu_u[bite_mask]))
-    average_asset_test_loss = float(
-        np.dot(mu_u[bite_mask], (tr_full - tr)[bite_mask]))
+    bite = (tr_full - tr) > 1e-12
+    asset_test_bite_mass = float(np.sum(mod.dist[bite]))
+    average_asset_test_loss = float(np.sum(mod.dist[bite] *
+                                           (tr_full - tr)[bite]))
 
     Y = mod.output()
     return {
@@ -24,11 +26,12 @@ def summarize_equilibrium(mod, label):
         "r": mod.r,
         "w": mod.w,
         "tau": mod.tau,
-        "N": mod.pi_stat[0],
+        "N": float(mod.pi_stat[mod.labor.is_employed].sum()),
         "benefit_costs": benefit_costs,
         "benefit_costs/Y": benefit_costs / Y,
         "mass_borrowing": float(np.sum(mod.dist[grid < 0.0, :])),
-        "share_unemp_receiving_ha": share_receiving_ha,
+        "share_receiving_ha": share_receiving_ha,
+        "ha_eligible_mass": elig_mass,
         "asset_test_bite_mass": asset_test_bite_mass,
         "average_asset_test_loss": average_asset_test_loss,
         "market_clearing_residual": mod.aggregate_capital() - mod.K,
@@ -36,9 +39,9 @@ def summarize_equilibrium(mod, label):
 
 
 def _interp_v(mod, grid):
-    out = np.empty((len(grid), 2))
-    out[:, 0] = np.interp(grid, mod.a_grid, mod.v[:, 0])
-    out[:, 1] = np.interp(grid, mod.a_grid, mod.v[:, 1])
+    out = np.empty((len(grid), mod.Nz))
+    for z in range(mod.Nz):
+        out[:, z] = np.interp(grid, mod.a_grid, mod.v[:, z])
     return out
 
 
@@ -51,6 +54,7 @@ def compute_cev(baseline, policy_mod):
     """
     Consumption-equivalent variation of policy_mod relative to baseline,
     evaluated on baseline.a_grid_dist and weighted by baseline.dist.
+    Requires both models to share beta, eta and the state space.
     """
     grid = baseline.a_grid_dist
     V_base = _interp_v(baseline, grid)
@@ -66,8 +70,9 @@ def compute_cev(baseline, policy_mod):
 
 def cev_summary(baseline, policy_mod, label, a_thresh_split=None):
     cev = compute_cev(baseline, policy_mod)
-    w = baseline.dist                            # shape (M, 2)
+    w = baseline.dist                            # (M, Nz)
     grid = baseline.a_grid_dist
+    lab = baseline.labor
     w_flat = w.flatten()
     cev_flat = cev.flatten()
     total_mass = w_flat.sum()
@@ -77,30 +82,34 @@ def cev_summary(baseline, policy_mod, label, a_thresh_split=None):
 
     def wavg(wi, vi):
         s = wi.sum()
-        return float(np.dot(wi, vi) / s) if s > 0 else float("nan")
+        return float(np.dot(wi.flatten(), vi.flatten()) / s) \
+            if s > 0 else float("nan")
 
     sort_idx = np.argsort(cev_flat)
-    sorted_w = w_flat[sort_idx]
+    cum_w = np.cumsum(w_flat[sort_idx]) / total_mass
     sorted_cev = cev_flat[sort_idx]
-    cum_w = np.cumsum(sorted_w) / total_mass
 
     def wquantile(q):
         idx = np.searchsorted(cum_w, q)
         return float(sorted_cev[min(idx, len(sorted_cev) - 1)])
 
-    return {
+    out = {
         "regime": label,
         "cev_mean_pct":       100.0 * wavg(w_flat, cev_flat),
-        "cev_employed_pct":   100.0 * wavg(w[:, 0], cev[:, 0]),
-        "cev_unemployed_pct": 100.0 * wavg(w[:, 1], cev[:, 1]),
-        "cev_low_asset_pct":  100.0 * wavg(w[low_mask].flatten(),
-                                           cev[low_mask].flatten()),
-        "cev_high_asset_pct": 100.0 * wavg(w[~low_mask].flatten(),
-                                           cev[~low_mask].flatten()),
+        "cev_employed_pct":   100.0 * wavg(w[:, lab.is_employed],
+                                           cev[:, lab.is_employed]),
+        "cev_unemployed_pct": 100.0 * wavg(w[:, lab.is_unemp],
+                                           cev[:, lab.is_unemp]),
+        "cev_low_asset_pct":  100.0 * wavg(w[low_mask], cev[low_mask]),
+        "cev_high_asset_pct": 100.0 * wavg(w[~low_mask], cev[~low_mask]),
         "cev_p10_pct": 100.0 * wquantile(0.10),
         "cev_p50_pct": 100.0 * wquantile(0.50),
         "cev_p90_pct": 100.0 * wquantile(0.90),
     }
+    if lab.is_inact.any():
+        out["cev_inactive_pct"] = 100.0 * wavg(w[:, lab.is_inact],
+                                               cev[:, lab.is_inact])
+    return out
 
 
 def stationary_welfare(mod):
@@ -109,9 +118,10 @@ def stationary_welfare(mod):
 
 
 def policy_diagnostics(mod):
+    mono = np.all(np.diff(mod.a_pol, axis=0) >= -1e-8, axis=0)
     return {
-        "monotone_employed":   bool(np.all(np.diff(mod.a_pol[:, 0]) >= -1e-8)),
-        "monotone_unemployed": bool(np.all(np.diff(mod.a_pol[:, 1]) >= -1e-8)),
+        "monotone_employed":   bool(mono[mod.labor.is_employed].all()),
+        "monotone_unemployed": bool(mono[mod.labor.is_unemp].all()),
         "upper_grid_mass":     float(mod.dist[-1, :].sum()),
         "lower_grid_mass":     float(mod.dist[0,  :].sum()),
     }

@@ -1,13 +1,13 @@
 import numpy as np
 import scipy.sparse as sp
 import scipy.sparse.linalg as spla
-from .model import egm_solve, build_transition_maps, markov_operator
+from .model import egm_solve
 
 
 def solve_household(mod, tol=1e-10, max_iter=8000):
     """EGM iteration on the consumption policy; also sets a_pol."""
     x, dx = mod.cash_on_hand(mod.a_grid)
-    if mod.c_pol is None:
+    if mod.c_pol is None or mod.c_pol.shape != x.shape:
         # start from consuming a fixed fraction of cash on hand
         mod.c_pol = np.maximum(0.3 * x, 1e-6)
     egm_solve(mod.c_pol, mod.a_grid, x, dx, mod.pi, mod.beta, mod.eta,
@@ -15,133 +15,157 @@ def solve_household(mod, tol=1e-10, max_iter=8000):
     mod.a_pol = np.clip(x - mod.c_pol, mod.amin, mod.amax)
 
 
+def _lottery(grid, values):
+    """Young-lottery indices and weights of `values` on `grid` (per column)."""
+    g = np.clip(values, grid[0], grid[-1])
+    idx = np.clip(np.searchsorted(grid, g, side="right"), 1, len(grid) - 1)
+    lo = idx - 1
+    span = grid[idx] - grid[lo]
+    t = np.clip((g - grid[lo]) / span, 0.0, 1.0)
+    return lo, idx, t
+
+
+def _transition_matrix(mod, grid, policy):
+    """
+    Sparse column-stochastic transition T on `grid` x labor states, flat
+    index n = z * len(grid) + j, induced by the savings policy and the
+    labor Markov chain.
+    """
+    M = len(grid)
+    Nz = mod.Nz
+    lo, hi, t = _lottery(grid, policy)
+    n = M * Nz
+    js = np.arange(M)
+    rows, cols, vals = [], [], []
+    for z in range(Nz):
+        src = z * M + js
+        for z2 in range(Nz):
+            p = mod.pi[z, z2]
+            if p == 0.0:
+                continue
+            rows.append(z2 * M + lo[:, z]); cols.append(src)
+            vals.append(p * (1.0 - t[:, z]))
+            rows.append(z2 * M + hi[:, z]); cols.append(src)
+            vals.append(p * t[:, z])
+    return sp.csc_matrix(
+        (np.concatenate(vals), (np.concatenate(rows), np.concatenate(cols))),
+        shape=(n, n))
+
+
 def solve_value_function(mod):
     """
-    Value of the converged policy, by direct solution of the linear system
-    V = u(c) + beta * Pi (x) P(a') V  (interpolation weights from a_pol).
-    Exact policy evaluation - no iteration needed.
+    Value of the converged policy by direct sparse solve of
+    (I - beta * B) V = u(c), where B interpolates V at the savings choice.
     """
-    Na = mod.num_a
-    n = 2 * Na
-    u = (mod.c_pol ** (1.0 - mod.eta) - 1.0) / (1.0 - mod.eta)
+    Na, Nz = mod.num_a, mod.Nz
+    n = Na * Nz
+    if mod.eta == 1.0:
+        u = np.log(mod.c_pol)
+    else:
+        u = (mod.c_pol ** (1.0 - mod.eta) - 1.0) / (1.0 - mod.eta)
 
-    idx = np.searchsorted(mod.a_grid, mod.a_pol, side="right")
-    idx = np.clip(idx, 1, Na - 1)
-    lo = idx - 1
-    span = mod.a_grid[idx] - mod.a_grid[lo]
-    t = np.clip((mod.a_pol - mod.a_grid[lo]) / span, 0.0, 1.0)
-
-    A = np.zeros((n, n))
-    rows = np.arange(Na)
-    for z in range(2):
-        rn = z * Na + rows
-        for z2 in range(2):
-            coef = mod.beta * mod.pi[z, z2]
-            np.add.at(A, (rn, z2 * Na + lo[:, z]), coef * (1.0 - t[:, z]))
-            np.add.at(A, (rn, z2 * Na + idx[:, z]), coef * t[:, z])
-
-    V = np.linalg.solve(np.eye(n) - A, u.T.reshape(n))
-    mod.v = V.reshape(2, Na).T.copy()
+    B = _transition_matrix(mod, mod.a_grid, mod.a_pol).T  # row = today
+    A = sp.identity(n, format="csc") - mod.beta * B.tocsc()
+    V = spla.spsolve(A, u.T.reshape(n))
+    mod.v = V.reshape(Nz, Na).T.copy()
 
 
 def solve_distribution(mod, tol=1e-11, max_iter=20000):
     """
-    Stationary distribution by direct sparse solve of (T - I) mu = 0 with
-    sum(mu) = 1.  The transition matrix T has 4 nonzeros per column (two
-    asset lottery points x two employment states), so the sparse LU is
-    orders of magnitude faster than power iteration, whose mixing time
-    explodes when the asset test creates slow-moving wealth regions.
+    Stationary distribution of the policy-induced Markov chain.
+
+    Two verified methods, tried in size-dependent order, with power
+    iteration as the last resort:
+
+    - "Grounded" sparse LU of (T - I) with mu[j0] = 1 pinned at a
+      reference node and the redundant equation dropped.  Very fast for
+      few labor states, but LU fill-in explodes as Nz grows.
+    - ARPACK (scipy.sparse.linalg.eigs) for the Perron eigenvector,
+      warm-started from the previous distribution.  Scales to many labor
+      states, but stalls when slow-mixing wealth dynamics (e.g. under the
+      asset test) push the second eigenvalue extremely close to one.
+
+    Every candidate solution is accepted only if its stationarity
+    residual max|T mu - mu| is tiny, so a failing method falls through.
     """
     M = len(mod.a_grid_dist)
-    lo = np.empty((M, 2), dtype=np.int32)
-    hi = np.empty((M, 2), dtype=np.int32)
-    w_lo = np.empty((M, 2))
-    w_hi = np.empty((M, 2))
-    build_transition_maps(mod.a_grid, mod.a_grid_dist, mod.a_pol,
-                          lo, hi, w_lo, w_hi)
+    Nz = mod.Nz
+    n = M * Nz
+    g_fine = np.column_stack([
+        np.interp(mod.a_grid_dist, mod.a_grid, mod.a_pol[:, z])
+        for z in range(Nz)])
+    T = _transition_matrix(mod, mod.a_grid_dist, g_fine)
 
-    # source node n = iz*M + j sends pi[iz, iz2]*w to (lo/hi[j, iz], iz2)
-    n = 2 * M
-    src = np.empty(4 * n, dtype=np.int64)
-    dst = np.empty(4 * n, dtype=np.int64)
-    val = np.empty(4 * n)
-    k = 0
-    cols = np.arange(M)
-    for iz in range(2):
-        for iz2 in range(2):
-            p = mod.pi[iz, iz2]
-            for tgt, wgt in ((lo[:, iz], w_lo[:, iz]),
-                             (hi[:, iz], w_hi[:, iz])):
-                src[k:k + M] = iz * M + cols
-                dst[k:k + M] = iz2 * M + tgt
-                val[k:k + M] = p * wgt
-                k += M
+    def accept(mu):
+        if mu is None or not np.all(np.isfinite(mu)):
+            return False
+        if np.max(np.abs(T @ mu - mu)) >= 1e-8:
+            return False
+        mod.dist = np.ascontiguousarray(mu.reshape(Nz, M).T)
+        return True
 
-    # Solve the "grounded" system: (T - I) mu = 0 has one redundant equation
-    # (columns of T sum to one), so pin mu[j0] = 1 at a reference node j0,
-    # drop equation j0, and solve for the rest.  This keeps the matrix
-    # fully sparse - a dense normalisation row would cause severe LU
-    # fill-in.  The choice of j0 only works if the true stationary
-    # distribution puts mass on it, so verify the stationarity residual and
-    # walk through fallback candidates (distribution supports move around
-    # drastically while the GE loop hunts for K).
-    diag = np.arange(n, dtype=np.int64)
-    rows = np.concatenate([dst, diag])
-    colsA = np.concatenate([src, diag])
-    data = np.concatenate([val, -np.ones(n)])
+    def try_eigs():
+        if mod.dist is not None and mod.dist.shape == (M, Nz):
+            v0 = np.clip(mod.dist.T.reshape(n), 1e-16, None)
+        else:
+            v0 = np.full(n, 1.0 / n)
+        try:
+            w, V = spla.eigs(T, k=1, which="LM", v0=v0,
+                             ncv=min(30, n - 1), tol=1e-12, maxiter=30)
+            mu = V[:, 0].real
+            if mu.sum() < 0:
+                mu = -mu
+            mu = np.clip(mu, 0.0, None)
+            s = mu.sum()
+            if s > 0 and abs(w[0].real - 1.0) < 1e-6:
+                return accept(mu / s)
+        except (spla.ArpackNoConvergence, spla.ArpackError):
+            pass
+        return False
 
-    def grounded_solve(j0):
-        on_rhs = colsA == j0
-        to_rhs = on_rhs & (rows != j0)
-        rhs = np.zeros(n - 1)
-        rr = rows[to_rhs]
-        np.add.at(rhs, rr - (rr > j0), -data[to_rhs])
-        keep = (rows != j0) & ~on_rhs
-        r = rows[keep]
-        c = colsA[keep]
-        A = sp.csc_matrix((data[keep], (r - (r > j0), c - (c > j0))),
-                          shape=(n - 1, n - 1))
-        with np.errstate(all="ignore"):
-            x = spla.spsolve(A, rhs)
-        if not np.all(np.isfinite(x)):
-            return None
-        mu = np.insert(x, j0, 1.0)
-        mu = np.clip(mu, 0.0, None)
-        s = mu.sum()
-        return mu / s if s > 0 else None
+    def try_grounded():
+        A_full = (T - sp.identity(n, format="csc")).tocsr()
 
-    candidates = []
-    if mod.dist is not None:
-        candidates.append(int(np.argmax(mod.dist.T.reshape(n))))
-    candidates += [int(np.argmin(np.abs(mod.a_grid_dist - mod.K))),
-                   M - 2, 1]
+        def grounded_solve(j0):
+            keep = np.ones(n, dtype=bool)
+            keep[j0] = False
+            B = A_full[keep][:, keep]
+            rhs = -A_full[keep][:, j0].toarray().ravel()
+            with np.errstate(all="ignore"):
+                x = spla.spsolve(B.tocsc(), rhs)
+            if not np.all(np.isfinite(x)):
+                return None
+            mu = np.insert(x, j0, 1.0)
+            mu = np.clip(mu, 0.0, None)
+            s = mu.sum()
+            return mu / s if s > 0 else None
 
-    Tdist = np.empty((M, 2))
-    for j0 in candidates:
-        mu = grounded_solve(j0)
-        if mu is None:
-            continue
-        dist = np.ascontiguousarray(mu.reshape(2, M).T)
-        Tdist.fill(0.0)
-        markov_operator(Tdist, dist, lo, hi, w_lo, w_hi, mod.pi)
-        if np.max(np.abs(Tdist - dist)) < 1e-8:
-            mod.dist = dist
+        candidates = []
+        if mod.dist is not None and mod.dist.shape == (M, Nz):
+            candidates.append(int(np.argmax(mod.dist.T.reshape(n))))
+        iz_mode = int(np.argmax(mod.pi_stat))
+        candidates += [
+            iz_mode * M + int(np.argmin(np.abs(mod.a_grid_dist - mod.K))),
+            iz_mode * M + M - 2,
+            iz_mode * M + 1]
+        return any(accept(grounded_solve(j0)) for j0 in candidates)
+
+    # LU fill-in is cheap for few labor states; Krylov scales to many
+    methods = (try_grounded, try_eigs) if n < 8000 else (try_eigs, try_grounded)
+    for method in methods:
+        if method():
             return
 
-    # last resort: power iteration (slow but unconditionally convergent)
-    dist = np.zeros((M, 2))
-    i0 = np.argmin(np.abs(mod.a_grid_dist))
-    dist[i0, 0] = mod.pi_stat[0]
-    dist[i0, 1] = mod.pi_stat[1]
-    Tdist = np.zeros_like(dist)
+    # --- last resort: power iteration -------------------------------------
+    mu = np.full(n, 1.0 / n)
     for _ in range(max_iter):
-        Tdist.fill(0.0)
-        markov_operator(Tdist, dist, lo, hi, w_lo, w_hi, mod.pi)
-        converged = np.max(np.abs(Tdist - dist)) < tol
-        dist, Tdist = Tdist, dist
-        if converged:
+        mu_new = T @ mu
+        if np.max(np.abs(mu_new - mu)) < tol:
+            mu = mu_new
             break
-    mod.dist = dist / dist.sum()
+        mu = mu_new
+    mu = np.clip(mu, 0.0, None)
+    mod.dist = np.ascontiguousarray((mu / mu.sum()).reshape(Nz, M).T)
 
 
 def solve_general_equilibrium(
@@ -218,7 +242,6 @@ def solve_general_equilibrium(
     side = 0
     for it in range(max_iter):
         K_mid = (K_lo * ed_hi - K_hi * ed_lo) / (ed_hi - ed_lo)
-        # keep strictly inside the bracket
         gap = K_hi - K_lo
         K_mid = min(max(K_mid, K_lo + 1e-3 * gap), K_hi - 1e-3 * gap)
         ed_mid, tau_mid, K_imp = solve_at_K(K_mid, 0.5 * (tau_lo + tau_hi))
