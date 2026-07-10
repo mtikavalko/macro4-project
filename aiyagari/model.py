@@ -1,250 +1,191 @@
+"""
+Aiyagari economy with an arbitrary finite labor-state process and an
+asset-tested housing-allowance transfer.
+
+Pure numpy/scipy implementation - no compilation, no internet access and
+no packages beyond the standard scientific stack are required, so the
+package can be copied as-is into restricted research environments such as
+Statistics Finland's FIONA remote-access system.
+"""
+
 import numpy as np
-from numba import njit, prange
+from .labor import LaborProcess, two_state_process
 
 
-@njit(cache=True, fastmath=True)
-def _interp_1d(grid, vals, x):
-    if x <= grid[0]:
-        return vals[0]
-    if x >= grid[-1]:
-        return vals[-1]
-    lo, hi = 0, len(grid) - 1
-    while hi - lo > 1:
-        mid = (lo + hi) // 2
-        if grid[mid] < x:
-            lo = mid
-        else:
-            hi = mid
-    t = (x - grid[lo]) / (grid[hi] - grid[lo])
-    return vals[lo] * (1.0 - t) + vals[hi] * t
+def _power_grid(amin, amax, n, curv):
+    t = np.linspace(0.0, 1.0, n)
+    return amin + (amax - amin) * t ** curv
 
 
-@njit(cache=True, fastmath=True)
-def _transfer(a, b, phi_a, a_thresh):
-    excess = a - a_thresh
-    if excess < 0.0:
-        excess = 0.0
-    out = b - phi_a * excess
-    return out if out > 0.0 else 0.0
+def egm_solve(c_pol, a_grid, x, dx, Pi, beta, eta, tol=1e-10, max_iter=8000):
+    """
+    Endogenous-grid-method iteration on the consumption policy (in place).
 
+    c_pol : (Na, Nz) consumption on the exogenous asset grid.
+    x     : (Na, Nz) cash on hand x_z(a) = R a + inc_z(a).
+    dx    : (Na, Nz) marginal return d x_z / d a, which differs from R
+            inside the housing-allowance phase-out band and enters the
+            Euler equation through the envelope condition.
+    """
+    Na, Nz = c_pol.shape
+    amin = a_grid[0]
+    a_col = a_grid[:, None]
+    it = 0
+    for it in range(max_iter):
+        emu = (dx * c_pol ** (-eta)) @ Pi.T          # E[u'(c') dx'] by state
+        c_endo = (beta * emu) ** (-1.0 / eta)
+        x_endo = c_endo + a_col
+        # guard against tiny non-monotonicities at the asset-test kinks
+        np.maximum.accumulate(x_endo, axis=0, out=x_endo)
 
-@njit(cache=True, fastmath=True)
-def _action_value_cont(a_prime, cih, iz, v, a_grid, beta, eta, pi):
-    c = cih - a_prime
-    if c <= 0.0:
-        return -1e30
-    fv = pi[iz, 0] * _interp_1d(a_grid, v[:, 0], a_prime) + \
-         pi[iz, 1] * _interp_1d(a_grid, v[:, 1], a_prime)
-    return (c ** (1.0 - eta) - 1.0) / (1.0 - eta) + beta * fv
+        c_new = np.empty_like(c_pol)
+        for z in range(Nz):
+            c_new[:, z] = np.interp(x[:, z], x_endo[:, z], c_endo[:, z])
+            # borrowing constraint binds below the first endogenous point
+            lo = x[:, z] <= x_endo[0, z]
+            c_new[lo, z] = x[lo, z] - amin
+            # linear extrapolation above the last endogenous point
+            hi = x[:, z] >= x_endo[-1, z]
+            if hi.any():
+                span = x_endo[-1, z] - x_endo[-2, z]
+                slope = (c_endo[-1, z] - c_endo[-2, z]) / span if span > 0 else 1.0
+                c_new[hi, z] = c_endo[-1, z] + slope * (x[hi, z] - x_endo[-1, z])
+        np.clip(c_new, 1e-12, None, out=c_new)
 
-
-@njit(cache=True, fastmath=True)
-def _gss(a, b, cih, iz, v, a_grid, beta, eta, pi, tol=1e-8, max_iter=500):
-    phi = (np.sqrt(5.0) - 1.0) / 2.0
-    c = b - phi * (b - a)
-    d = a + phi * (b - a)
-    fc = _action_value_cont(c, cih, iz, v, a_grid, beta, eta, pi)
-    fd = _action_value_cont(d, cih, iz, v, a_grid, beta, eta, pi)
-    for _ in range(max_iter):
-        if abs(b - a) < tol:
+        diff = np.max(np.abs(c_new - c_pol))
+        c_pol[:] = c_new
+        if diff < tol:
             break
-        if fc < fd:
-            a, c, fc = c, d, fd
-            d = a + phi * (b - a)
-            fd = _action_value_cont(d, cih, iz, v, a_grid, beta, eta, pi)
-        else:
-            b, d, fd = d, c, fc
-            c = b - phi * (b - a)
-            fc = _action_value_cont(c, cih, iz, v, a_grid, beta, eta, pi)
-    mid = (a + b) / 2.0
-    return mid, _action_value_cont(mid, cih, iz, v, a_grid, beta, eta, pi)
-
-
-@njit(cache=True, fastmath=True)
-def _action_value_disc(ia_prime, cih, iz, v, a_grid, beta, eta, pi):
-    c = cih - a_grid[ia_prime]
-    if c <= 0.0:
-        return -1e30
-    fv = pi[iz, 0] * v[ia_prime, 0] + pi[iz, 1] * v[ia_prime, 1]
-    return (c ** (1.0 - eta) - 1.0) / (1.0 - eta) + beta * fv
-
-
-@njit(cache=True, fastmath=True, parallel=True)
-def bellman_operator(Tv, v, a_pol, tau, r, w, b, a_grid, beta, eta, pi,
-                     phi_a, a_thresh, do_opt):
-    Na, Nz = v.shape
-    for idx in prange(Na * Nz):
-        ia = idx % Na
-        iz = idx // Na
-        a = a_grid[ia]
-        if iz == 0:
-            cih = (1.0 + (1.0 - tau) * r) * a + (1.0 - tau) * w
-        else:
-            cih = (1.0 + (1.0 - tau) * r) * a + _transfer(a, b, phi_a, a_thresh)
-
-        if do_opt:
-            lo, hi = 0, Na - 1
-            while hi - lo > 2:
-                mid = (lo + hi) // 2
-                if _action_value_disc(mid + 1, cih, iz, v, a_grid, beta, eta, pi) > \
-                   _action_value_disc(mid, cih, iz, v, a_grid, beta, eta, pi):
-                    lo = mid
-                else:
-                    hi = mid + 1
-            a_lo, a_hi = a_grid[lo], a_grid[hi]
-            if a_hi <= a_lo:
-                a_star = a_lo
-                val = _action_value_cont(a_star, cih, iz, v, a_grid, beta, eta, pi)
-            else:
-                a_star, val = _gss(a_lo, a_hi, cih, iz, v, a_grid, beta, eta, pi)
-        else:
-            a_star = a_pol[ia, iz]
-            val = _action_value_cont(a_star, cih, iz, v, a_grid, beta, eta, pi)
-
-        Tv[ia, iz] = val
-        a_pol[ia, iz] = a_star
-
-
-@njit(cache=True, fastmath=True)
-def _bisect_right(grid, x):
-    lo, hi = 0, len(grid)
-    while lo < hi:
-        mid = (lo + hi) // 2
-        if x < grid[mid]:
-            hi = mid
-        else:
-            lo = mid + 1
-    return lo
-
-
-@njit(cache=True, fastmath=True)
-def build_transition_maps(a_coarse, a_fine, g_coarse, lo, hi, w_lo, w_hi):
-    M, N = len(a_fine), len(a_coarse)
-    a_min_f, a_max_f = a_fine[0], a_fine[-1]
-    for j in range(M):
-        for iz in range(2):
-            af = a_fine[j]
-            idx = _bisect_right(a_coarse, af)
-            if idx == 0:
-                i, t = 0, 0.0
-            elif idx >= N:
-                i, t = N - 2, 1.0
-            else:
-                i = idx - 1
-                span = a_coarse[i + 1] - a_coarse[i]
-                t = (af - a_coarse[i]) / span if span > 0.0 else 0.0
-            g = g_coarse[i, iz] * (1.0 - t) + g_coarse[i + 1, iz] * t
-            if g <= a_min_f:
-                k, u = 0, 0.0
-            elif g >= a_max_f:
-                k, u = M - 2, 1.0
-            else:
-                jdx = _bisect_right(a_fine, g)
-                if jdx <= 0:
-                    k, u = 0, 0.0
-                elif jdx >= M:
-                    k, u = M - 2, 1.0
-                else:
-                    k = jdx - 1
-                    span = a_fine[k + 1] - a_fine[k]
-                    u = (g - a_fine[k]) / span if span > 0.0 else 0.0
-            lo[j, iz] = k
-            hi[j, iz] = k + 1
-            w_lo[j, iz] = 1.0 - u
-            w_hi[j, iz] = u
-
-
-@njit(cache=True, fastmath=True)
-def markov_operator(Tdist, dist, lo, hi, w_lo, w_hi, pi):
-    M = dist.shape[0]
-    for j in range(M):
-        for iz in range(2):
-            mass = dist[j, iz]
-            if mass == 0.0:
-                continue
-            k, kp1 = lo[j, iz], hi[j, iz]
-            wl, wh = w_lo[j, iz], w_hi[j, iz]
-            for iz2 in range(2):
-                p = mass * pi[iz, iz2]
-                Tdist[k,   iz2] += p * wl
-                Tdist[kp1, iz2] += p * wh
-
-
-@njit(cache=True, fastmath=True)
-def transfer_vec(a_grid, b, phi_a, a_thresh):
-    """Vectorized transfer for the full distribution grid."""
-    out = np.empty(len(a_grid))
-    for i in range(len(a_grid)):
-        out[i] = _transfer(a_grid[i], b, phi_a, a_thresh)
-    return out
-
-
-def stationary_markov(pi):
-    w, V = np.linalg.eig(pi.T)
-    v = V[:, np.isclose(w, 1.0)].real
-    if v.sum() < 0:
-        v = -v
-    return (v / v.sum())[:, 0]
+    return it
 
 
 class AiyagariModel:
+    """
+    Heterogeneous-agent economy.  Households face the labor-state Markov
+    chain in `labor`; state income is
+
+        inc_z(a) = (1 - tau) * w * e_z + b0_z
+                   + ha_elig_z * max(0, b_ha - phi_a * max(a - a_thresh, 0))
+
+    and a proportional tax tau on capital and labor income balances the
+    transfer budget in equilibrium.
+
+    For backward compatibility the original two-state economy can still be
+    constructed directly with (b_ui, peu, pue) instead of `labor`.
+    """
+
     def __init__(
         self,
-        beta: float = 0.95,
+        beta: float = 0.94926,
         eta: float = 2.0,
-        delta: float = 0.04,
-        alpha: float = 0.36,
-        b: float = 0.1,
-        tau0: float = 0.02,
-        K0: float = 30.0,
-        peu: float = 0.0435,
-        pue: float = 0.5,
-        amin: float = -2.0,
-        amax: float = 30.0,
-        num_a: int = 2000,
-        num_a_dist_factor: int = 3,
+        delta: float = 0.06,
+        alpha: float = 0.38,
+        labor: LaborProcess = None,
+        b_ui: float = None,
+        b_ha: float = 0.0,
         phi_a: float = 0.0,
-        a_thresh: float = 1.0,
+        a_thresh: float = 0.27,
+        tau0: float = 0.012,
+        K0: float = 6.0,
+        peu: float = 0.0642,
+        pue: float = 0.70,
+        amin: float = -0.32,
+        amax: float = 40.0,
+        num_a: int = 400,
+        num_a_dist: int = 1600,
+        grid_curv: float = 3.0,
     ):
         self.beta = beta
         self.eta = eta
         self.delta = delta
         self.alpha = alpha
-        self.b = b
+        self.b_ha = b_ha
         self.phi_a = phi_a
         self.a_thresh = a_thresh
         self.tau = tau0
-        self.peu = peu
-        self.pue = pue
 
-        self.pi = np.array([[1.0 - peu, peu],
-                            [pue,       1.0 - pue]])
-        self.pi_stat = stationary_markov(self.pi)
+        if labor is None:
+            if b_ui is None:
+                raise ValueError("Provide either `labor` or `b_ui`.")
+            labor = two_state_process(peu, pue, b_ui)
+        self.labor = labor
+        self.b_ui = b_ui
+        self.Nz = labor.n
+        self.pi = labor.Pi                    # kept under the old names
+        self.pi_stat = labor.pi_stat
+        self.L = labor.aggregate_labor()
 
         self.amin = amin
         self.amax = amax
         self.num_a = num_a
-        self.a_grid = np.linspace(amin, amax, num_a)
-        self.a_grid_dist = np.linspace(amin, amax, num_a * num_a_dist_factor)
+        self.a_grid = _power_grid(amin, amax, num_a, grid_curv)
+        self.a_grid_dist = _power_grid(amin, amax, num_a_dist, grid_curv)
 
+        self.c_pol = None
+        self.a_pol = None
         self.v = None
+        self.dist = None
         self.K = K0
         self.update_prices(K0)
 
+    # welfare.py historically used .dist_grid
+    @property
+    def dist_grid(self):
+        return self.a_grid_dist
+
     def update_prices(self, K):
-        L = self.pi_stat[0]
-        kl = K / L
+        kl = K / self.L
         self.r = self.alpha * kl ** (self.alpha - 1.0) - self.delta
         self.w = (1.0 - self.alpha) * kl ** self.alpha
 
+    def housing_allowance(self, a_grid):
+        """Asset-tested HA amount at each asset level (for eligible states)."""
+        if self.b_ha == 0.0:
+            return np.zeros(len(a_grid))
+        return np.clip(self.b_ha - self.phi_a *
+                       np.maximum(a_grid - self.a_thresh, 0.0), 0.0, None)
+
+    def transfer_matrix(self, a_grid=None):
+        """(n_grid, Nz) transfer received in each state at each asset level."""
+        a = self.a_grid_dist if a_grid is None else a_grid
+        ha = self.housing_allowance(a)
+        return (self.labor.b0[None, :]
+                + np.outer(ha, self.labor.ha_elig.astype(float)))
+
+    def transfer_profile(self, a_grid=None, b_ha=None):
+        """Total transfer of the first unemployed state (2-state legacy API)."""
+        a = self.a_grid_dist if a_grid is None else a_grid
+        iz = int(np.argmax(self.labor.is_unemp))
+        if b_ha is not None:
+            saved, self.b_ha = self.b_ha, b_ha
+            out = self.transfer_matrix(a)[:, iz]
+            self.b_ha = saved
+            return out
+        return self.transfer_matrix(a)[:, iz]
+
+    def cash_on_hand(self, a_grid):
+        """x_z(a) and d x_z / d a on a grid, at the current prices."""
+        R = 1.0 + (1.0 - self.tau) * self.r
+        labor_inc = (1.0 - self.tau) * self.w * self.labor.e
+        x = R * a_grid[:, None] + labor_inc[None, :] + self.transfer_matrix(a_grid)
+        dx = np.full_like(x, R)
+        if self.phi_a > 0.0 and self.b_ha > 0.0:
+            taper_end = self.a_thresh + self.b_ha / self.phi_a
+            in_taper = (a_grid > self.a_thresh) & (a_grid < taper_end)
+            dx[np.ix_(in_taper, self.labor.ha_elig)] = R - self.phi_a
+        return x, dx
+
+    # ------------------------------------------------------ aggregates
     def aggregate_capital(self):
-        return float(np.dot(self.dist[:, 0] + self.dist[:, 1], self.a_grid_dist))
+        return float(self.dist.sum(axis=1) @ self.a_grid_dist)
 
     def aggregate_transfer(self):
-        tr = transfer_vec(self.a_grid_dist, self.b, self.phi_a, self.a_thresh)
-        return float(np.dot(self.dist[:, 1], tr))
+        return float(np.sum(self.dist * self.transfer_matrix()))
 
     def implied_tau(self):
         costs = self.aggregate_transfer()
-        denom = self.r * self.K + self.w * self.pi_stat[0]
+        denom = self.r * self.K + self.w * self.L
         return costs / denom if denom > 0.0 else 0.0
+
+    def output(self):
+        return self.K ** self.alpha * self.L ** (1.0 - self.alpha)
