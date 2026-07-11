@@ -11,7 +11,9 @@ def summarize_equilibrium(mod, label):
 
     benefit_costs = float(np.sum(mod.dist * tr))
     elig_mass = float(mod.dist[:, mod.labor.ha_elig].sum())
-    share_receiving_ha = float(np.sum(mod.dist[ha > 1e-12]))
+    ha_recipient_mass = float(np.sum(mod.dist[ha > 1e-12]))
+    share_elig_receiving_ha = (ha_recipient_mass / elig_mass
+                               if elig_mass > 0 else float("nan"))
 
     bite = (tr_full - tr) > 1e-12
     asset_test_bite_mass = float(np.sum(mod.dist[bite]))
@@ -30,7 +32,8 @@ def summarize_equilibrium(mod, label):
         "benefit_costs": benefit_costs,
         "benefit_costs/Y": benefit_costs / Y,
         "mass_borrowing": float(np.sum(mod.dist[grid < 0.0, :])),
-        "share_receiving_ha": share_receiving_ha,
+        "ha_recipient_mass": ha_recipient_mass,
+        "share_elig_receiving_ha": share_elig_receiving_ha,
         "ha_eligible_mass": elig_mass,
         "asset_test_bite_mass": asset_test_bite_mass,
         "average_asset_test_loss": average_asset_test_loss,

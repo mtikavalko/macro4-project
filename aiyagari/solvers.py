@@ -13,6 +13,9 @@ def solve_household(mod, tol=1e-10, max_iter=8000):
     egm_solve(mod.c_pol, mod.a_grid, x, dx, mod.pi, mod.beta, mod.eta,
               tol, max_iter)
     mod.a_pol = np.clip(x - mod.c_pol, mod.amin, mod.amax)
+    # keep the budget identity exact where the grid bounds bind, so the
+    # value function's u(c) is consistent with the a' transitions
+    mod.c_pol = np.maximum(x - mod.a_pol, 1e-12)
 
 
 def _lottery(grid, values):
