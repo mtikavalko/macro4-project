@@ -330,6 +330,16 @@ RHO_UI_PRE, RHO_UI_POST = DEFAULT.rr_ui_pre, DEFAULT.rr_ui_post
 RHO_HA_PRE = DEFAULT.ha_pre_eur / EUR_AVG_WAGE
 RHO_HA_POST = DEFAULT.ha_post_eur / EUR_AVG_WAGE
 
+# Statutory Orpo-reform factors, to be applied to *estimated* pre-reform
+# benefit levels so the post-reform counterparts follow the same data:
+# - UI: staggering (100/80/75 % of the allowance over the spell, averaged
+#   and blended with non-staggered basic-security recipients) plus the
+#   abolition of child supplements  =>  ~ -16 %
+# - HA: compensation rate 80 -> 70 % and basic deductible 42 -> 50 %
+#   (>= 12.5 % cut for all recipients, ~ 17 % for unemployed households)
+UI_REFORM_FACTOR = RHO_UI_POST / RHO_UI_PRE     # ~ 0.844
+HA_REFORM_FACTOR = RHO_HA_POST / RHO_HA_PRE     # ~ 0.827
+
 A_TEST_LO = model_units(DEFAULT.atest_lo_eur)
 A_TEST_HI = model_units(DEFAULT.atest_hi_eur)
 

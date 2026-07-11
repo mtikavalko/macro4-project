@@ -163,13 +163,21 @@ def estimate_earnings_process(perus, tulo):
 # ======================================================= 3. benefits
 def estimate_benefits(perus, tulo):
     """
-    Replacement rates and benefit levels among the unemployed.
+    Replacement rates and benefit levels, in real (deflated) euros when
+    CONFIG["cpi"] is set - consistent with the wage anchor.
+
     rr_ui = earnings-related allowance (annualized) / own previous-year
-    wage, for people employed in t-1 and unemployed in t.
+    wage, for people employed in t-1 and unemployed in t.  The housing
+    allowance level is estimated over ALL non-employed recipients, because
+    the model pays the same asset-tested b_ha in the unemployed and
+    inactive states.
     """
     v = VAR
     d = perus.merge(tulo, on=[v["pid"], v["year"]], how="inner")
     d["state"] = d[v["activity"]].map(PTOIM_TO_EUN).fillna("N")
+    for col in (v["wage"], v["ui_earnings_related"], v["ui_basic"],
+                v["housing_allowance"]):
+        d[col] = _deflate(d[col], d[v["year"]])
     d = d.sort_values([v["pid"], v["year"]])
     g = d.groupby(v["pid"])
     d["state_prev"] = g["state"].shift(1)
@@ -182,14 +190,13 @@ def estimate_benefits(perus, tulo):
                    / new_u["wage_prev"]).median())
 
     unemp = d[d["state"] == "U"]
-    ha_rec = unemp[unemp[v["housing_allowance"]] > 0]
+    nonemp = d[d["state"] != "E"]
+    ha_rec = nonemp[nonemp[v["housing_allowance"]] > 0]
     return {
         "rr_ui_pre": rr_ui,
         "ui_floor_eur": float(
             unemp.loc[unemp[v["ui_basic"]] > 0, v["ui_basic"]].median()),
         "ha_pre_eur": float(ha_rec[v["housing_allowance"]].mean()),
-        # post-reform values: re-run on years >= 2025, or apply the
-        # statutory changes to the pre-reform estimates as in the notebook
     }
 
 
@@ -221,7 +228,17 @@ def estimate_wealth(vtutk):
 
 # ======================================================== assembly
 def build_targets(flows, earnings, benefits, wealth, out_path):
-    """Combine the estimated blocks into a CalibrationTargets JSON."""
+    """
+    Combine the estimated blocks into a CalibrationTargets JSON.
+
+    Post-reform benefit levels are derived from the ESTIMATED pre-reform
+    values by applying the statutory Orpo-reform factors, so the reform
+    experiment stays anchored to the same data (leaving them at the class
+    defaults would silently compare against unrelated placeholder levels).
+    Once post-reform register years are available, estimate them directly
+    instead.
+    """
+    from aiyagari.calibration import UI_REFORM_FACTOR, HA_REFORM_FACTOR
     t = CalibrationTargets(
         eur_avg_wage=earnings["eur_avg_wage"],
         p_eu=flows["p_eu"], p_ue=flows["p_ue"], p_en=flows["p_en"],
@@ -230,14 +247,16 @@ def build_targets(flows, earnings, benefits, wealth, out_path):
         rho_e=earnings["rho_e"], sigma_e=earnings["sigma_e"],
         var_log_earnings=earnings["var_log_earnings"],
         rr_ui_pre=benefits["rr_ui_pre"],
+        rr_ui_post=benefits["rr_ui_pre"] * UI_REFORM_FACTOR,
         ui_floor_eur=benefits["ui_floor_eur"],
         ha_pre_eur=benefits["ha_pre_eur"],
+        ha_post_eur=benefits["ha_pre_eur"] * HA_REFORM_FACTOR,
         mean_wealth_eur=wealth["mean_wealth_eur"],
         median_wealth_eur=wealth["median_wealth_eur"],
         wealth_p10_eur=wealth["wealth_p10_eur"],
         wealth_p90_eur=wealth["wealth_p90_eur"],
         wealth_gini=wealth["wealth_gini"],
-        # statutory, not estimated: rr_ui_post, ha_post_eur, thresholds
+        # statutory, not estimated: asset-test thresholds
     )
     t.to_json(out_path)
     return t
@@ -322,6 +341,13 @@ def _selftest():
         "tyoton_jasen": rng.random(5_000) < 0.1})
     wea = estimate_wealth(wealth_df)
 
+    # deflation consistency: with a CPI of 0.5 everywhere, real benefit
+    # levels must double
+    from aiyagari.calibration import UI_REFORM_FACTOR, HA_REFORM_FACTOR
+    CONFIG["cpi"] = {y: 0.5 for y in range(2018, 2018 + T)}
+    ben_real = estimate_benefits(perus, tulo)
+    CONFIG["cpi"] = None
+
     checks = [
         ("p_eu", flows["p_eu"], TRUE["p_eu"], 0.01),
         ("p_ue", flows["p_ue"], TRUE["p_ue"], 0.02),
@@ -331,6 +357,8 @@ def _selftest():
         ("rr_ui_pre", ben["rr_ui_pre"], TRUE["rr_ui"], 0.02),
         ("ui_floor", ben["ui_floor_eur"], 9_600.0, 1.0),
         ("ha_pre", ben["ha_pre_eur"], 3_900.0, 1.0),
+        ("ui_floor deflated", ben_real["ui_floor_eur"], 19_200.0, 1.0),
+        ("ha_pre deflated", ben_real["ha_pre_eur"], 7_800.0, 1.0),
     ]
     ok = True
     for name, got, want, tol in checks:
@@ -345,6 +373,13 @@ def _selftest():
     assert t2 == t
     out.unlink()
     print("  JSON round-trip OK")
+
+    # post-reform levels must follow the estimated pre values via the
+    # statutory factors, not the class defaults
+    assert abs(t.rr_ui_post - ben["rr_ui_pre"] * UI_REFORM_FACTOR) < 1e-12
+    assert abs(t.ha_post_eur - ben["ha_pre_eur"] * HA_REFORM_FACTOR) < 1e-12
+    print(f"  post-reform derived OK (rr_ui {t.rr_ui_post:.4f}, "
+          f"ha {t.ha_post_eur:,.0f} EUR/yr)")
     assert ok, "SELFTEST FAILED"
     print("SELFTEST PASSED")
 
