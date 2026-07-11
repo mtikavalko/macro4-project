@@ -174,6 +174,11 @@ def estimate_benefits(perus, tulo):
     """
     v = VAR
     d = perus.merge(tulo, on=[v["pid"], v["year"]], how="inner")
+    # same working-age window as the flow and earnings blocks - otherwise
+    # the non-employed HA pool picks up retirees, students and minors that
+    # are outside the model's labor process
+    lo, hi = CONFIG["working_age"]
+    d = d[(d[v["age"]] >= lo) & (d[v["age"]] <= hi)].copy()
     d["state"] = d[v["activity"]].map(PTOIM_TO_EUN).fillna("N")
     for col in (v["wage"], v["ui_earnings_related"], v["ui_basic"],
                 v["housing_allowance"]):
@@ -182,8 +187,10 @@ def estimate_benefits(perus, tulo):
     g = d.groupby(v["pid"])
     d["state_prev"] = g["state"].shift(1)
     d["wage_prev"] = g[v["wage"]].shift(1)
+    d["year_prev"] = g[v["year"]].shift(1)
 
     new_u = d[(d["state"] == "U") & (d["state_prev"] == "E")
+              & (d["year_prev"] == d[v["year"]] - 1)
               & (d["wage_prev"] > CONFIG["min_annual_wage_eur"])
               & (d[v["ui_earnings_related"]] > 0)]
     rr_ui = float((new_u[v["ui_earnings_related"]]
@@ -287,11 +294,24 @@ def main():
 
 # ======================================================== self-test
 def _selftest():
-    """Synthetic FOLK-like panel with known parameters; verify recovery."""
+    """
+    Synthetic FOLK-like panel with known parameters; verify recovery.
+
+    The panel is deliberately adversarial to the estimators:
+      - all euro amounts are NOMINAL under 2 %/yr inflation, with the CPI
+        index handed to CONFIG (estimators must deflate);
+      - retirees aged 66-85 receive a LOWER housing allowance (must be
+        excluded by the working-age filter);
+      - working-age unemployed and inactive receive DIFFERENT housing
+        allowance levels (the estimator must pool both, not U only).
+    """
     rng = np.random.default_rng(0)
     N, T = 30_000, 6
     TRUE = dict(p_eu=0.07, p_ue=0.65, p_en=0.02, p_ne=0.12, p_un=0.10,
-                p_nu=0.02, rho=0.95, sigma=0.40, rr_ui=0.45)
+                p_nu=0.02, rho=0.95, sigma=0.40, rr_ui=0.45,
+                ui_floor=9_600.0, ha_u=4_000.0, ha_n=3_700.0,
+                ha_retiree=2_400.0)
+    CPI = {2018 + i: 0.90 + 0.02 * i for i in range(T)}   # base = last year
 
     P = np.array([  # E U N
         [1 - TRUE["p_eu"] - TRUE["p_en"], TRUE["p_eu"], TRUE["p_en"]],
@@ -302,6 +322,7 @@ def _selftest():
     z = rng.normal(0, TRUE["sigma"], N)          # latent log productivity
     age0 = rng.integers(20, 58, N)
     rows = []
+    prev_real_wage = np.zeros(N)
     for t in range(T):
         if t > 0:
             u = rng.random(N)
@@ -310,28 +331,51 @@ def _selftest():
             z = TRUE["rho"] * z + rng.normal(
                 0, TRUE["sigma"] * np.sqrt(1 - TRUE["rho"] ** 2), N)
         age = age0 + t
-        wage = np.where(states[:, t] == 0,
-                        np.exp(10.4 + 0.03 * age - 3e-4 * age ** 2 + z), 0.0)
-        prev_wage = np.array([r["palk"] for r in rows[-N:]]) \
-            if t > 0 else np.zeros(N)
-        ui = np.where((states[:, t] == 1) & (prev_wage > 0),
-                      TRUE["rr_ui"] * prev_wage, 0.0)
-        basic = np.where((states[:, t] == 1) & (ui == 0), 9_600.0, 0.0)
-        ha = np.where((states[:, t] != 0) & (rng.random(N) < 0.6), 3_900.0, 0)
+        infl = CPI[2018 + t]
+        real_wage = np.where(states[:, t] == 0,
+                             np.exp(10.4 + 0.03 * age - 3e-4 * age ** 2 + z),
+                             0.0)
+        ui = np.where((states[:, t] == 1) & (prev_real_wage > 0),
+                      TRUE["rr_ui"] * prev_real_wage, 0.0)
+        basic = np.where((states[:, t] == 1) & (ui == 0),
+                         TRUE["ui_floor"], 0.0)
+        draw = rng.random(N)
+        ha = np.where((states[:, t] == 1) & (draw < 0.6), TRUE["ha_u"], 0.0) \
+            + np.where((states[:, t] == 2) & (draw < 0.6), TRUE["ha_n"], 0.0)
         for i in range(N):
             rows.append(dict(shnro=i, vuosi=2018 + t, age=age[i],
                              ptoim1=(11, 12, 22)[states[i, t]],
-                             palk=wage[i], ansiopvraha=ui[i],
-                             peruspvraha_tmtuki=basic[i], asumistuki=ha[i]))
+                             palk=real_wage[i] * infl,
+                             ansiopvraha=ui[i] * infl,
+                             peruspvraha_tmtuki=basic[i] * infl,
+                             asumistuki=ha[i] * infl))
+        prev_real_wage = real_wage
     df = pd.DataFrame(rows)
+
+    # retirees outside the working-age window, most receiving the lower
+    # pensioner-level housing allowance
+    N_old = 6_000
+    old_age = rng.integers(66, 86, N_old)
+    old = pd.concat([pd.DataFrame({
+        "shnro": N + np.arange(N_old), "vuosi": 2018 + t,
+        "age": old_age + t, "ptoim1": 24, "palk": 0.0,
+        "ansiopvraha": 0.0, "peruspvraha_tmtuki": 0.0,
+        "asumistuki": np.where(rng.random(N_old) < 0.7,
+                               TRUE["ha_retiree"], 0.0) * CPI[2018 + t],
+    }) for t in range(T)], ignore_index=True)
+    df = pd.concat([df, old], ignore_index=True)
+
     VAR.update(age="age", educ="")
     perus = df[["shnro", "vuosi", "age", "ptoim1"]]
     tulo = df[["shnro", "vuosi", "palk", "ansiopvraha",
                "peruspvraha_tmtuki", "asumistuki"]]
 
+    CONFIG["cpi"] = CPI                       # estimators must deflate
     flows = estimate_flows(df)
     earn = estimate_earnings_process(perus, tulo)
     ben = estimate_benefits(perus, tulo)
+    CONFIG["cpi"] = None
+    ben_nominal = estimate_benefits(perus, tulo)   # wrong on purpose
 
     wealth_df = pd.DataFrame({
         "knro": np.arange(5_000),
@@ -341,12 +385,13 @@ def _selftest():
         "tyoton_jasen": rng.random(5_000) < 0.1})
     wea = estimate_wealth(wealth_df)
 
-    # deflation consistency: with a CPI of 0.5 everywhere, real benefit
-    # levels must double
     from aiyagari.calibration import UI_REFORM_FACTOR, HA_REFORM_FACTOR
-    CONFIG["cpi"] = {y: 0.5 for y in range(2018, 2018 + T)}
-    ben_real = estimate_benefits(perus, tulo)
-    CONFIG["cpi"] = None
+
+    # expected pooled HA among working-age non-employed, from the
+    # simulated state masses (recipiency probability is equal in U and N)
+    m_u = float((states == 1).sum())
+    m_n = float((states == 2).sum())
+    ha_expected = (m_u * TRUE["ha_u"] + m_n * TRUE["ha_n"]) / (m_u + m_n)
 
     checks = [
         ("p_eu", flows["p_eu"], TRUE["p_eu"], 0.01),
@@ -354,18 +399,29 @@ def _selftest():
         ("p_ne", flows["p_ne"], TRUE["p_ne"], 0.01),
         ("rho_e", earn["rho_e"], TRUE["rho"], 0.03),
         ("sigma_e", earn["sigma_e"], TRUE["sigma"], 0.03),
-        ("rr_ui_pre", ben["rr_ui_pre"], TRUE["rr_ui"], 0.02),
-        ("ui_floor", ben["ui_floor_eur"], 9_600.0, 1.0),
-        ("ha_pre", ben["ha_pre_eur"], 3_900.0, 1.0),
-        ("ui_floor deflated", ben_real["ui_floor_eur"], 19_200.0, 1.0),
-        ("ha_pre deflated", ben_real["ha_pre_eur"], 7_800.0, 1.0),
+        ("rr_ui (real)", ben["rr_ui_pre"], TRUE["rr_ui"], 0.02),
+        ("ui_floor (real)", ben["ui_floor_eur"], TRUE["ui_floor"], 1.0),
+        ("ha pooled U+N (real)", ben["ha_pre_eur"], ha_expected, 50.0),
     ]
     ok = True
     for name, got, want, tol in checks:
         passed = abs(got - want) < tol
         ok &= passed
-        print(f"  {name:<12s} est {got:9.4f}  true {want:9.4f}  "
+        print(f"  {name:<22s} est {got:9.4f}  true {want:9.4f}  "
               f"{'OK' if passed else 'FAIL'}")
+
+    # the fixes must have teeth on this data: without the working-age
+    # filter the retirees drag the HA level down, and without deflation
+    # the pooled nominal floor misses the real one
+    ha_all_real = df["asumistuki"] / df["vuosi"].map(CPI)
+    naive_all_age = float(ha_all_real[ha_all_real > 0].mean())
+    assert ben["ha_pre_eur"] - naive_all_age > 200, "age filter had no effect"
+    assert abs(ben_nominal["ui_floor_eur"] - TRUE["ui_floor"]) > 100, \
+        "deflation had no effect"
+    print(f"  age-filter teeth: pooled {ben['ha_pre_eur']:,.0f} vs "
+          f"naive all-age {naive_all_age:,.0f}")
+    print(f"  deflation teeth: nominal floor "
+          f"{ben_nominal['ui_floor_eur']:,.0f} vs real {TRUE['ui_floor']:,.0f}")
 
     out = Path(__file__).with_name("targets_selftest.json")
     t = build_targets(flows, earn, ben, wea, out)
