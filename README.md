@@ -19,6 +19,11 @@ earnings-related unemployment allowance).
     SMM fitting.
   - `welfare.py` — consumption-equivalent welfare and diagnostics.
 - `examples/fiona_workflow.py` — end-to-end data-calibration workflow.
+- `examples/fiona_estimation_template.py` — register-data estimation
+  skeleton for use inside FIONA: four estimator blocks (flows, earnings
+  AR(1), benefits, wealth) producing the targets JSON; fill in the file
+  paths and Taika variable names. `--selftest` verifies the estimators
+  on synthetic data (runs anywhere, no microdata needed).
 
 ## Requirements
 
