@@ -174,6 +174,11 @@ def estimate_benefits(perus, tulo):
     """
     v = VAR
     d = perus.merge(tulo, on=[v["pid"], v["year"]], how="inner")
+    # same working-age window as the flow and earnings blocks - otherwise
+    # the non-employed HA pool picks up retirees, students and minors that
+    # are outside the model's labor process
+    lo, hi = CONFIG["working_age"]
+    d = d[(d[v["age"]] >= lo) & (d[v["age"]] <= hi)].copy()
     d["state"] = d[v["activity"]].map(PTOIM_TO_EUN).fillna("N")
     for col in (v["wage"], v["ui_earnings_related"], v["ui_basic"],
                 v["housing_allowance"]):
@@ -182,8 +187,10 @@ def estimate_benefits(perus, tulo):
     g = d.groupby(v["pid"])
     d["state_prev"] = g["state"].shift(1)
     d["wage_prev"] = g[v["wage"]].shift(1)
+    d["year_prev"] = g[v["year"]].shift(1)
 
     new_u = d[(d["state"] == "U") & (d["state_prev"] == "E")
+              & (d["year_prev"] == d[v["year"]] - 1)
               & (d["wage_prev"] > CONFIG["min_annual_wage_eur"])
               & (d[v["ui_earnings_related"]] > 0)]
     rr_ui = float((new_u[v["ui_earnings_related"]]
