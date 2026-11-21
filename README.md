@@ -122,3 +122,15 @@ after the data moments are in).
 pip install -r requirements.txt
 jupyter notebook Macro4Project_v2.ipynb
 ```
+
+To check that the committed results still reproduce, re-execute the notebook
+in memory and print only the outputs that changed (timings and figure sizes
+are ignored):
+
+```
+pip install nbformat nbclient ipykernel
+python3 tools/nbcheck.py Macro4Project_v2.ipynb
+```
+
+`python3 tools/nbtext.py <notebook> [--outline] [cell | first-last]` prints a
+notebook's code and text output without the embedded images.
